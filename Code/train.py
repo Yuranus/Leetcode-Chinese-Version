@@ -1,234 +1,436 @@
 """
-This file contains all operations about training models using PyTorch
+This file is used to train the CRNN model using PyTorch
+We add distillation procedure
 
 Created by Kunhong Yu
-Date: 2020/04/23
+Date: 2020/09/02
 """
 import torch as t
-import torchvision as tv
-from torch.nn import functional as F
-from config import Config
-from models import *
-from utils import vis_images, vis_procedure
 import tqdm
-import os
-from sklearn.externals import joblib
+from configs import Config
+from utils import GetDataLoader
+from model import CRNN_def, Distilled_CRNN_def
+import matplotlib.pyplot as plt
+from utils import model_info, cal_batch_acc
+from utils import get_batch_label, train_test_split
+from torch.nn import functional as F
 
 opt = Config()
 
-def train_models(**kwargs):
-    """This function is used to train the model"""
+def train(**kwargs):
+    """train the crnn model"""
     opt.parse(kwargs)
-    opt.print_configs()
+    opt.print_args()
+
+    train_test_split(path = opt.data_path,
+                     img_format = opt.img_format,
+                     label_format = opt.label_format,
+                     generating_again = opt.generating_again,
+                     split_rate = opt.split_rate)
 
     device = t.device('cuda') if opt.use_gpu else t.device('cpu')
     #Step 0 Decide the structure of the model#
     #Step 1 Load the data set#
+    dataset, dataloader = \
+        GetDataLoader(path = opt.data_path,
+                      train = True,
+                      img_format = opt.img_format,
+                      label_format = opt.label_format,
+                      img_height = opt.img_height,
+                      img_width = opt.img_width,
+                      img_channels = opt.img_channels,
+                      batch_size = opt.batch_size)
     #Step 2 Reshape the inputs#
     #Step 3 Normalize the inputs#
-    t.manual_seed(opt.training_seed)
-    if opt.data_flag == 'mnist':
-        train_dataset = tv.datasets.MNIST(root = opt.data_path,
-                                          train = True,
-                                          download = False,
-                                          transform = opt.transforms_)
-    elif opt.data_flag == 'cifar10':
-        train_dataset = tv.datasets.CIFAR10(root = opt.data_path + 'CIFAR10',
-                                            train = True,
-                                            download = False,
-                                            transform = opt.transforms_)
-
-    elif opt.data_flag == 'cifar100':
-        train_dataset = tv.datasets.CIFAR100(root = opt.data_path + 'CIFAR100',
-                                             train = True,
-                                             download = False,
-                                             transform = opt.transforms_)
-
-    elif opt.data_flag == 'imagenette320':
-        train_dataset = tv.datasets.ImageFolder(root = opt.data_path + os.sep + 'imagenette/v320' + os.sep + 'train',
-                                                transform = opt.transforms_)
-
-    elif opt.data_flag == 'imagewoof320':
-        train_dataset = tv.datasets.ImageFolder(root = opt.data_path + os.sep + 'imagewoof/v320' + os.sep + 'train',
-                                                transform = opt.transforms_)
-
-    elif opt.data_flag == 'tiny_in':
-        train_dataset = tv.datasets.ImageFolder(root = opt.data_path + os.sep + 'tiny_imagenet' + os.sep + 'train',
-                                                transform = opt.transforms_)
-        #print(train_dataset[0][0].size())
-
-        class2idx = train_dataset.class_to_idx
-        joblib.dump(class2idx, opt.data_path + os.sep + 'tiny_imagenet' + os.sep + 'class2idx.pkl')
-
-    else:
-        raise Exception('No other data set!')
-
-    vis_images(opt, train_dataset, num_images = 36)
-
-    train_loader = t.utils.data.DataLoader(train_dataset,
-                                           shuffle = True,
-                                           batch_size = opt.batch_size)
-
     #Step 4 Initialize parameters#
     #Step 5 Forward propagation(Vectorization/Activation functions)#
-    if opt.data_flag == 'mnist':#mnist
-        model = MNISTModel_def(size = opt.size,
-                               sigmoid_size = opt.sigmoid_size_ratio,
-                               model_config = opt.model_config,
-                               clipped_value = opt.clipped_value).to(device)
+    crnn_model = CRNN_def(in_c = opt.img_channels,
+                          feature_size = 512,
+                          lstm_hidden = opt.lstm_hidden,
+                          output_size = opt.output_size,
+                          multilines = opt.multilines,
+                          multisteps = opt.multisteps,
+                          num_rows = opt.num_rows)
+    crnn_model.to(device)
+    distilled_crnn_model = Distilled_CRNN_def(in_c = opt.img_channels,
+                                              feature_size = 512,
+                                              lstm_hidden = opt.lstm_hidden,
+                                              output_size = opt.output_size,
+                                              multilines = opt.multilines,
+                                              multisteps = opt.multisteps,
+                                              num_rows = opt.num_rows)
+    distilled_crnn_model.to(device)
 
-    elif opt.data_flag.startswith('cifar'):#cifar10 or cifar100
-        if opt.model_str == 'resnet34':
-            model = ResNet34_VGG16_def(size = opt.size,
-                                       sigmoid_size = opt.sigmoid_size_ratio,
-                                       num_classes = 10 if opt.data_flag == 'cifar10' else 100,
-                                       model_config = opt.model_config,
-                                       clipped_value = opt.clipped_value,
-                                       resnet34_pretrained = opt.resnet34_pretrained,
-                                       vgg16_pretrained = opt.vgg16_pretrained).to(device)
-        else:
-            model = CIFARModel_def(size = opt.size,
-                                   sigmoid_size = opt.sigmoid_size_ratio,
-                                   output_size = 10 if opt.data_flag == 'cifar10' else 100,
-                                   model_config = opt.model_config,
-                                   clipped_value = opt.clipped_value).to(device)
+    print('CRNN model : ')
+    for name, parameters in crnn_model.named_parameters():
+        print('\t', name, '...', parameters.requires_grad)
 
-    elif opt.data_flag == 'imagenette320' or opt.data_flag == 'imagewoof320':#imagenette320/imagewoof320
-        model = ResNet34_VGG16_def(size = opt.size,
-                                   sigmoid_size = opt.sigmoid_size_ratio,
-                                   num_classes = 10,
-                                   model_config = opt.model_config,
-                                   clipped_value = opt.clipped_value,
-                                   resnet34_pretrained = opt.resnet34_pretrained,
-                                   vgg16_pretrained = opt.vgg16_pretrained).to(device)
-
-    elif opt.data_flag == 'tiny_in':
-        model = ResNet34_VGG16_def(size = opt.size,
-                                   sigmoid_size = opt.sigmoid_size_ratio,
-                                   num_classes = 200,
-                                   model_config = opt.model_config,
-                                   clipped_value = opt.clipped_value,
-                                   resnet34_pretrained = opt.resnet34_pretrained,
-                                   vgg16_pretrained = opt.vgg16_pretrained).to(device)
-    else:
-        raise Exception('No other data set!')
-
-    for name, parameters in model.named_parameters():
-        print(name, '...', parameters.requires_grad)
+    print('Distilled CRNN model : ')
+    for name, parameters in distilled_crnn_model.named_parameters():
+        print('\t', name, '...', parameters.requires_grad)
 
     #Step 6 Compute cost#
-    hard_loss = t.nn.CrossEntropyLoss().to(device)
-    #soft_loss defined in the dynamic graph
+    ctc_loss = t.nn.CTCLoss().to(device)#use CTC to derive the whole loss function
     #Step 7 Backward propagation(Vectorization/Activation functions gradients)#
-    optimizer = t.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()),
-                             lr = opt.init_lr, amsgrad = True, weight_decay = opt.weight_decay)
+    if opt.optimizer == 'sgd' or opt.optimizer == 'momentum' or opt.optimizer == 'nesterov':
+        crnn_optimizer = t.optim.SGD(filter(lambda p: p.requires_grad, crnn_model.parameters()),
+                                     lr = opt.init_lr,
+                                     momentum = 0.9 if opt.optimizer == 'momentum' or opt.optimizer == 'nesterov' else 0.,
+                                     nesterov = True if opt.optimizer == 'nesterov' else False,
+                                     weight_decay = opt.weight_decay)
+        distilled_crnn_optimizer = t.optim.SGD(filter(lambda p: p.requires_grad, distilled_crnn_model.parameters()),
+                                               lr = opt.init_lr,
+                                               momentum = 0.9 if opt.optimizer == 'momentum' or opt.optimizer == 'nesterov' else 0.,
+                                               nesterov = True if opt.optimizer == 'nesterov' else False,
+                                               weight_decay = opt.weight_decay)
+    elif opt.optimizer == 'adam' or opt.optimizer == 'amsgrad':
+        crnn_optimizer = t.optim.Adam(filter(lambda p: p.requires_grad, crnn_model.parameters()),
+                                      lr = opt.init_lr,
+                                      amsgrad = True if opt.optimizer == 'amsgrad' else False,
+                                      weight_decay = opt.weight_decay)
+        distilled_crnn_optimizer = t.optim.Adam(filter(lambda p: p.requires_grad, distilled_crnn_model.parameters()),
+                                                lr = opt.init_lr,
+                                                amsgrad = True if opt.optimizer == 'amsgrad' else False,
+                                                weight_decay = opt.weight_decay)
 
-    lr_optimizer = t.optim.lr_scheduler.MultiStepLR(optimizer = optimizer,
-                                                    milestones = opt.lr_change_epochs,
-                                                    gamma = opt.learning_rate_decay)#learning rate decay
+    else:
+        raise Exception('No other optimizers!')
 
+    crnn_lr_schedule = t.optim.lr_scheduler.MultiStepLR(crnn_optimizer,
+                                                        milestones = opt.lr_decay_epochs,
+                                                        gamma = opt.lr_decay_rate)
+    distilled_lr_schedule = t.optim.lr_scheduler.MultiStepLR(distilled_crnn_optimizer,
+                                                             milestones = opt.lr_decay_epochs,
+                                                             gamma = opt.lr_decay_rate)
+
+    _ = model_info(crnn_model)
+    _ = model_info(distilled_crnn_model)
+
+    train_crnn_loss = []
+    train_crnn_acc = []
+    best_crnn_acc = 0.5#must have better accuracy than random guess of 0.5
+    train_distilled_crnn_loss = []
+    train_distilled_crnn_acc = []
+    best_distilled_crnn_acc = 0.5#must have better accuracy than random guess of 0.5
+
+    cd_loss = []
+    lstm_loss = []
+    h_loss = []
+    c_loss = []
+    softloss = []
     #Step 8 Update parameters#
-    teacher_hard_loss_ = []
-    student_hard_loss_ = []
-    soft_loss_ = []
-    teacher_accs_ = []
-    student_accs_ = []
-    best_acc = 0
     for epoch in tqdm.tqdm(range(opt.epochs)):
-        epoch_acc = 0
+        print('Epoch : %d / %d.' % (epoch + 1, opt.epochs))
+        print('Current epoch learning rate for CRNN: ', crnn_optimizer.param_groups[0]['lr'])
+        if opt.distilled:
+            print('Current epoch learning rate for Distilled_CRNN: ', distilled_crnn_optimizer.param_groups[0]['lr'])
+        epoch_crnn_acc = 0.
+        epoch_distilled_crnn_acc = 0.
         count = 0
-        print('Epoch %d / %d.' % (epoch + 1, opt.epochs))
-        print('Learning rate : ', optimizer.param_groups[0]['lr'])
-        for i, (batch_x, batch_y) in enumerate(train_loader):
-            #print(batch_y)
-            batch_soft_loss = 0.
-
-            optimizer.zero_grad()
+        for i, (batch_x, index, path) in enumerate(dataloader):
             batch_x = batch_x.to(device)
-            batch_x = batch_x.view(batch_x.size(0), opt.image_channel, opt.image_height, opt.image_width)
-            batch_y = batch_y.to(device)
-            teacher_out, student_out = model(batch_x)
+            index = index.to(device)
+            batch_x = batch_x.view(batch_x.size(0), opt.img_channels, opt.img_height, opt.img_width)
 
-            #Compute whole cost#
-            batch_teacher_hard_loss = hard_loss(teacher_out, batch_y)
-            batch_student_hard_loss = hard_loss(student_out, batch_y)
-            teacher_hard_loss_.append(batch_teacher_hard_loss.item())
-            student_hard_loss_.append(batch_student_hard_loss.item())
-            if opt.alpha != 0.:
-                batch_soft_loss = -t.mean(t.sum(F.softmax(teacher_out / opt.temperature, dim = 1) * \
-                                                t.log(F.softmax(student_out / opt.temperature, dim = 1) + 1e-10),
-                                                dim = 1)).to(device)
-                soft_loss_.append(opt.alpha * batch_soft_loss.item())
+            crnn_optimizer.zero_grad()
+            if not opt.multisteps:
+                labels = get_batch_label(dataset, index)
+                text, length = opt.converter.encode(labels)
+                outputt, teachers, (hts, cts) = crnn_model(batch_x)
+                #output has shape : [m, t, output_size]
+                preds_size = [outputt.size(0)] * outputt.size(1)#batch_size * time_steps
+                batch_crnn_cost = ctc_loss(outputt, text.to(t.long).to(device),
+                                           t.IntTensor(preds_size).to(t.long).to(device),
+                                           length.to(t.long).to(device))#ctc loss
+            else:
+                outputts, teachers, (htss, ctss) = crnn_model(batch_x)
+                preds_size = [outputts[0].size(0)] * outputts[0].size(1)#batch_size * time_steps
+                batch_crnn_cost = 0.
+                labels = get_batch_label(dataset, index, multisteps = opt.multisteps, num_rows = opt.num_rows)
+                for step in range(len(outputts)):
+                    outputt = outputts[step]
+                    label = labels[step]
+                    text, length = opt.converter.encode(label)
+                    batch_crnn_cost += ctc_loss(outputt, text.to(t.long).to(device),
+                                                t.IntTensor(preds_size).to(t.long).to(device),
+                                                length.to(t.long).to(device))#ctc loss
 
-            #whole loss#
-            batch_loss = (batch_teacher_hard_loss + batch_student_hard_loss) + opt.alpha * batch_soft_loss
+                batch_crnn_cost /= len(outputts)
 
-            batch_loss.backward()
-            optimizer.step()
+            batch_crnn_cost.backward()
+            crnn_optimizer.step()
+
+            if opt.distilled:
+                distilled_crnn_optimizer.zero_grad()
+                if not opt.multisteps:
+                    outputs, students, (hss, css) = distilled_crnn_model(batch_x)
+                    #output has shape : [m, t, output_size]
+                    preds_size = [outputs.size(0)] * outputs.size(1)#batch_size * time_steps
+                else:
+                    outputss, students, (hsss, csss) = distilled_crnn_model(batch_x)
+                    preds_size = [outputss[0].size(0)] * outputss[0].size(1)#batch_size * time_steps
+
+                #1. CTC loss
+                if not opt.multisteps:
+                    batch_distilled_crnn_cost = ctc_loss(outputs, text.to(t.long).to(device),
+                                                         t.IntTensor(preds_size).to(t.long).to(device), length.to(t.long).to(device))
+
+                else:
+                    batch_ctc_loss = 0.
+                    for step in range(len(outputss)):
+                        outputs = outputss[step]
+                        label = labels[step]
+                        text, length = opt.converter.encode(label)
+                        batch_ctc_loss += ctc_loss(outputs, text.to(t.long).to(device),
+                                                   t.IntTensor(preds_size).to(t.long).to(device),
+                                                   length.to(t.long).to(device))
+                    batch_distilled_crnn_cost = batch_ctc_loss / (len(outputss) * 1.)
+
+                #2. cd loss
+                count_ = 0
+                batch_cd_loss = 0.
+                for teacher, student in zip(teachers, students):
+                    batch_cd_loss += t.mean(t.pow(teacher - student, 2)).to(device)
+                    count_ += 1
+                batch_cd_loss /= count_
+
+                batch_distilled_crnn_cost += opt.alpha * batch_cd_loss
+
+                #3. lstm loss
+                #3.1 H values
+                count_ = 0
+                cur_lossh = 0.
+                if not opt.multisteps:
+                    for ht, hs in zip(hts, hss):
+                        cur_lossh += t.mean(t.pow(ht - hs, 2)).to(device)
+                        count_ += 1
+                else:
+                    for hts, hss in zip(htss, hsss):
+                        cur_loss = 0.
+                        q = 0.
+                        for ht, hs in zip(hts, hss):
+                            cur_loss += t.mean(t.pow(ht - hs, 2)).to(device)
+                            q += 1.
+
+                        cur_lossh += cur_loss / q
+                        count_ += 1
+                cur_lossh /= count_
+                #3.2 C values
+                cur_lossc = 0.
+                count_ = 0
+                if not opt.multisteps:
+                    for ct, cs in zip(cts, css):
+                        cur_lossc += t.mean(t.pow(ct - cs, 2)).to(device)
+                        count_ += 1
+                else:
+                    for cts, css in zip(ctss, csss):
+                        cur_loss = 0.
+                        q = 0.
+                        for ct, cs in zip(cts, css):
+                            cur_loss += t.mean(t.pow(ct - cs, 2)).to(device)
+                            q += 1.
+
+                        cur_lossc += cur_loss / q
+                        count_ += 1
+                cur_lossc /= count_
+                batch_lstm_loss = (cur_lossc + cur_lossh) / 2.
+                batch_distilled_crnn_cost += opt.beta * batch_lstm_loss
+
+                #4. soft loss
+                if not opt.multisteps:
+                    batch_softloss = -t.mean(t.sum(F.softmax(outputt.detach() / opt.temperature, dim = 1) * \
+                                                    t.log(F.softmax(outputs / opt.temperature, dim = 1) + 1e-10),
+                                                    dim = 1)).to(device)
+                else:
+                    batch_softloss = 0.
+                    for outputt, outputs in zip(outputts, outputss):
+                        batch_softloss += -t.mean(t.sum(F.softmax(outputt.detach() / opt.temperature, dim = 1) * \
+                                                        t.log(F.softmax(outputs / opt.temperature, dim = 1) + 1e-10),
+                                                        dim = 1)).to(device)
+                    batch_softloss /= len(outputts)
+
+                batch_distilled_crnn_cost += opt.gamma * batch_softloss
+
+                batch_distilled_crnn_cost.backward()
+                distilled_crnn_optimizer.step()
 
             if i % opt.batch_size == 0:
-                model.eval()
-                teacher_batch_acc, student_batch_acc = cal_batch_acc(model, batch_x, batch_y)
-                model.train()
-                teacher_accs_.append(teacher_batch_acc)
-                student_accs_.append(student_batch_acc)
-                batch_acc = 2 * teacher_batch_acc * student_batch_acc / (teacher_batch_acc + student_batch_acc + 1e-7)
-                epoch_acc += batch_acc
                 count += 1
-                if opt.model_config == 'simple' or opt.model_config == 'se':
-                    print('\tBatch %d has loss : %.3f.--->\n\t\tteacher loss : %.3f || student loss : %.3f.--->teacher acc : %.2f%% || student acc : %.2f%%.' % \
-                          (i + 1, batch_loss.item(), batch_teacher_hard_loss.item(), batch_student_hard_loss.item(),
-                          teacher_batch_acc * 100, student_batch_acc * 100))
+                train_crnn_loss.append(batch_crnn_cost.item())
+                crnn_model.eval()
+                batch_crnn_acc, predictions = cal_batch_acc(crnn_model, opt.converter, batch_x, labels, level = opt.level)
 
-                elif opt.model_config == 'soft' or opt.model_config == 'all':
-                    print('\tBatch %d has loss : %.3f.--->\n\t\tteacher loss : %.3f || student loss : %.3f || soft loss : %.3f.--->teacher acc : %.2f%% || student acc : %.2f%%.' % \
-                          (i + 1, batch_loss.item(), batch_teacher_hard_loss.item(), batch_student_hard_loss.item(),
-                          opt.alpha * batch_soft_loss.item(), teacher_batch_acc * 100, student_batch_acc * 100))
+                print('\nCRNN samples predictions: ')
+                print('=' * 30)
+                print('Labels : ', label)
+                print('*' * 20)
+                print('Predictions : ', predictions)
+                print('=' * 30)
+                crnn_model.train()
+                train_crnn_acc.append(batch_crnn_acc)
+
+                if opt.distilled:
+                    train_distilled_crnn_loss.append(batch_distilled_crnn_cost.item())
+                    cd_loss.append(opt.alpha * batch_cd_loss.item())
+                    lstm_loss.append(opt.beta * batch_lstm_loss.item())
+                    h_loss.append(opt.beta * cur_lossh.item())
+                    c_loss.append(opt.beta * cur_lossc.item())
+                    softloss.append(opt.gamma * batch_softloss.item())
+                    distilled_crnn_model.eval()
+                    batch_distilled_crnn_acc, predictions = cal_batch_acc(distilled_crnn_model, opt.converter, batch_x,
+                                                                          label, level = opt.level)
+
+                    print('=' * 50)
+                    print('Distilled CRNN samples predictions : ')
+                    print('=' * 30)
+                    print('Labels : ', label)
+                    print('*' * 20)
+                    print('Predictions : ', predictions)
+                    print('=' * 30)
+
+                    distilled_crnn_model.train()
+                    train_distilled_crnn_acc.append(batch_distilled_crnn_acc)
+
+                print('\tCRNN : ')
+                print('\tBatch %d has crnn cost : %.3f.|| Accuracy : ' % (i + 1, batch_crnn_cost.item()), end = '')
+                if isinstance(batch_crnn_acc, tuple):
+                    print('Character-level acc : %.2f%%; Image-level acc : %.2f%%.' % (batch_crnn_acc[0] * 100., batch_crnn_acc[1] * 100.))
+                    combined_acc = (2. * batch_crnn_acc[0] * batch_crnn_acc[1]) / (batch_crnn_acc[0] + batch_crnn_acc[1] + 1e-7)#f1
+                    epoch_crnn_acc += combined_acc
                 else:
-                    raise Exception('No other model!')
+                    if opt.level == 'char':
+                        print('Character-level acc : %.2f%%.' % (batch_crnn_acc * 100.))
+                    elif opt.level == 'whole':
+                        print('Image-level acc : %.2f%%.' % (batch_crnn_acc * 100.))
+                    else:
+                        raise Exception('No other levels!')
 
-        lr_optimizer.step()
-        epoch_acc = (epoch_acc * 100) / count
-        print('This epoch has accuracy : {:.2f}%.'.format(epoch_acc))
-        if epoch_acc > best_acc:
-            best_acc = epoch_acc
-            t.save(model, './models/' + opt.data_flag + '/training_saved_best_model_' + opt.model_config + '_' + str(epoch + 1) + '_' + opt.model_str + '.pkl')
+                    epoch_crnn_acc += batch_crnn_acc
 
-    print('Training is done!')
+                if opt.distilled:
+                    print('\tDistilled : ')
+                    print('\tBatch %d has distilled crnn cost : %.3f.[softloss %3f & cd loss %.3f & lstm loss %.3f & h_loss %.3f & c_loss %.3f]. --> \n\t\tAccuracy : '
+                            % (i + 1, batch_distilled_crnn_cost.item(), opt.gamma * batch_softloss.item(),
+                               opt.alpha * batch_cd_loss.item(), opt.beta * batch_lstm_loss.item(),
+                               opt.beta * cur_lossh.item(), opt.beta * cur_lossc.item()), end = '')
+                    if isinstance(batch_distilled_crnn_acc, tuple):
+                        print('Character-level acc : %.2f%%; Image-level acc : %.2f%%.' % (
+                        batch_distilled_crnn_acc[0] * 100., batch_distilled_crnn_acc[1] * 100.))
+                        combined_acc = (2. * batch_distilled_crnn_acc[0] * batch_distilled_crnn_acc[1]) / (
+                                    batch_distilled_crnn_acc[0] + batch_distilled_crnn_acc[1] + 1e-7)  # f1
+                        epoch_distilled_crnn_acc += combined_acc
+                    else:
+                        if opt.level == 'char':
+                            print('Character-level acc : %.2f%%.' % (batch_distilled_crnn_acc * 100.))
+                        elif opt.level == 'whole':
+                            print('Image-level acc : %.2f%%.' % (batch_distilled_crnn_acc * 100.))
+                        else:
+                            raise Exception('No other levels!')
 
-    t.save(model, './models/' + opt.data_flag + '/saved_model_' + opt.model_config + '_' +opt.model_str + '.pkl')
+                        epoch_distilled_crnn_acc += batch_distilled_crnn_acc
 
-    if opt.model_config == 'simple' or opt.model_config == 'se':
-        vis_procedure(teacher_hard_loss = teacher_hard_loss_,
-                      student_hard_loss = student_hard_loss_,
-                      teacher_acc = teacher_accs_,
-                      student_acc = student_accs_,
-                      opt = opt)
+        epoch_crnn_acc /= count
+        epoch_distilled_crnn_acc /= count
 
-    if opt.model_config == 'soft' or opt.model_config == 'all':
-        vis_procedure(teacher_hard_loss = teacher_hard_loss_,
-                      student_hard_loss = student_hard_loss_,
-                      soft_loss = soft_loss_,
-                      teacher_acc = teacher_accs_,
-                      student_acc = student_accs_,
-                      opt = opt)
+        print('This epoch has crnn acc : {:.2f}%.'.format(epoch_crnn_acc * 100.))
+        if opt.save_best_model:
+            if epoch % opt.save_best_model_iter == 0:
+                if epoch_crnn_acc > best_crnn_acc:
+                    best_crnn_acc = epoch_crnn_acc
+                    t.save(crnn_model, './checkpoints/save_best_train_crnn_model_epoch_%d_%s.pkl' % (epoch + 1, opt.model_config))
+                else:
+                    print('This epoch has no improvement on training accuracy on crnn model, skipping saving the model!')
 
-def cal_batch_acc(model, data, labels):
-    """This function is used to calculate batch accuracy
-    Args :
-        --model: model instance, already load onto GPU if opt.use_gpu == True
-        --data: input data, already load onto GPU if opt.use_gpu == True
-        --labels: ground-truth labels, already load onto GPU if opt.use_gpu == True
-    return :
-        --teacher's batch accuracy and studnet's batch accuracy
-    """
-    batch_teacher_out, batch_student_out = model(data)
-    teacher_preds = t.max(batch_teacher_out, 1)[1].data
-    student_preds = t.max(batch_student_out, 1)[1].data
-    batch_acc_teacher = t.sum(teacher_preds == labels) / (data.size(0) * 1.)
-    batch_acc_student = t.sum(student_preds == labels) / (data.size(0) * 1.)
-    if opt.use_gpu:
-        batch_acc_teacher = batch_acc_teacher.cpu()
-        batch_acc_student = batch_acc_student.cpu()
+        if opt.distilled:
+            print('This epoch has distilled crnn acc : {:.2f}%.'.format(epoch_distilled_crnn_acc * 100.))
+            if opt.save_best_model:
+                if epoch % opt.save_best_model_iter == 0:
+                    if epoch_distilled_crnn_acc > best_distilled_crnn_acc:
+                        best_distilled_crnn_acc = epoch_distilled_crnn_acc
+                        t.save(distilled_crnn_model, './checkpoints/save_best_train_distilled_crnn_model_epoch_%d_%s.pkl' % (
+                                    epoch + 1, opt.model_config))
+                    else:
+                        print('This epoch has no improvement on training accuracy on distilled crnn model, skipping saving the model!')
 
-    return batch_acc_teacher.item(), batch_acc_student.item()
+        crnn_lr_schedule.step()
+        distilled_lr_schedule.step()
+
+    t.save(crnn_model, './checkpoints/final_crnn_model_%s.pkl' % opt.model_config)
+
+    f, ax = plt.subplots(1, 2)
+    f.suptitle('Useful statistics for CRNN')
+    ax[0].plot(range(len(train_crnn_loss)), train_crnn_loss, label = 'CRNN training loss')
+    ax[0].grid(True)
+    ax[0].set_title('CRNN training loss')
+    ax[0].legend(loc = 'best')
+
+    if isinstance(train_crnn_acc[0], tuple):
+        char_acc = [c_acc[0] for c_acc in train_crnn_acc]
+        whole_acc = [c_acc[1] for c_acc in train_crnn_acc]
+        ax[1].plot(range(len(char_acc)), char_acc, label = 'Character-level acc')
+        ax[1].plot(range(len(whole_acc)), whole_acc, label = 'Image-level acc')
+
+    else:
+        if opt.level == 'char':
+            ax[1].plot(range(len(train_crnn_acc)), train_crnn_acc, label = 'Character-level acc')
+        elif opt.level == 'whole':
+            ax[1].plot(range(len(train_crnn_acc)), train_crnn_acc, label = 'Image-level acc')
+        else:
+            raise Exception('No other levels!')
+
+    ax[1].grid(True)
+    ax[1].set_title('CRNN training acc')
+    ax[1].legend(loc = 'best')
+
+    plt.savefig('./results/training_crnn_statistics_%s.png' % opt.model_config)
+    plt.close()
+
+    if opt.distilled:
+        t.save(distilled_crnn_model, './checkpoints/final_distilled_crnn_model_%s.pkl' % opt.model_config)
+
+        f, ax = plt.subplots(1, 5)
+        f.suptitle('Useful statistics for Distilled CRNN')
+        ax[0].plot(range(len(train_distilled_crnn_loss)), train_distilled_crnn_loss, label = 'Distilled CRNN training loss')
+        ax[0].grid(True)
+        ax[0].set_title('Distilled CRNN training loss')
+        ax[0].legend(loc = 'best')
+
+        if isinstance(train_distilled_crnn_acc[0], tuple):
+            char_acc = [c_acc[0] for c_acc in train_distilled_crnn_acc]
+            whole_acc = [c_acc[1] for c_acc in train_distilled_crnn_acc]
+            ax[1].plot(range(len(char_acc)), char_acc, label= ' Character-level acc')
+            ax[1].plot(range(len(whole_acc)), whole_acc, label = 'Image-level acc')
+
+        else:
+            if opt.level == 'char':
+                ax[1].plot(range(len(train_distilled_crnn_acc)), train_distilled_crnn_acc, label = 'Character-level acc')
+            elif opt.level == 'whole':
+                ax[1].plot(range(len(train_distilled_crnn_acc)), train_distilled_crnn_acc, label = 'Image-level acc')
+            else:
+                raise Exception('No other levels!')
+
+        ax[1].grid(True)
+        ax[1].set_title('Distilled training acc')
+        ax[1].legend(loc = 'best')
+
+        ax[2].plot(range(len(cd_loss)), cd_loss, label = 'Distilled CRNN training cd loss')
+        ax[2].grid(True)
+        ax[2].set_title('Distilled CRNN training cd loss')
+        ax[2].legend(loc = 'best')
+
+        ax[3].plot(range(len(softloss)), softloss, label = 'Distilled CRNN training soft loss')
+        ax[3].grid(True)
+        ax[3].set_title('Distilled CRNN training soft loss')
+        ax[3].legend(loc = 'best')
+
+        ax[4].plot(range(len(lstm_loss)), lstm_loss, label = 'Distilled CRNN training lstm loss')
+        ax[4].plot(range(len(h_loss)), h_loss, label = 'Distilled CRNN training lstm hidden loss')
+        ax[4].plot(range(len(c_loss)), c_loss, label = 'Distilled CRNN training lstm cell loss')
+        ax[4].grid(True)
+        ax[4].set_title('Distilled CRNN training lstm loss')
+        ax[4].legend(loc = 'best')
+
+        plt.savefig('./results/training_distilled_crnn_statistics_%s.png' % opt.model_config)
+        plt.close()
+
+    print('Training is done!\n')
